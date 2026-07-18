@@ -1,14 +1,9 @@
 // =============================================================
-//  CARDSTOCK API v4 — Yahoo Finance (no key) + caching
-//  Stock history: Yahoo Finance chart endpoint (cached in Supabase)
-//  Card history: Supabase
+//  CARDSTOCK API v5 — Yahoo stocks + card history + card list
+//  Adds /api/card-list for search autocomplete.
 //
-//  ENV VARS on Render (FINNHUB/ALPHAVANTAGE no longer needed):
-//    SUPABASE_URL, SUPABASE_SERVICE, LOG_SECRET
-//
-//  Requires both Supabase tables:
-//    cardstock_history       (card history)
-//    cardstock_stock_cache   (stock cache)
+//  ENV VARS on Render: SUPABASE_URL, SUPABASE_SERVICE, LOG_SECRET
+//  Tables: cardstock_history, cardstock_stock_cache
 // =============================================================
 
 const express = require('express');
@@ -28,58 +23,59 @@ function indexTo100(points) {
   if (!base) return points.map(p => ({ t: p.t, v: 100 }));
   return points.map(p => ({ t: p.t, v: +((p.price / base) * 100).toFixed(2) }));
 }
-function windowRange(win) {
-  if (win === '3M') return '3mo';
-  if (win === '6M') return '6mo';
-  return '1y';
-}
+function wd(w){ if(w==='3M')return 90; if(w==='6M')return 182; return 365; }
+function yRange(w){ if(w==='3M')return '3mo'; if(w==='6M')return '6mo'; return '1y'; }
 
-app.get('/', (req, res) => {
-  res.json({ success: true, app: 'CardStock API', status: 'online' });
+app.get('/', (req, res) => res.json({ success: true, app: 'CardStock API', status: 'online' }));
+
+// ---- CARD LIST (for search autocomplete) ----
+// Returns the distinct card_keys that have any logged history.
+app.get('/api/card-list', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('cardstock_history')
+      .select('card_key')
+      .order('card_key', { ascending: true });
+    if (error) throw error;
+    const seen = {};
+    const keys = [];
+    (data || []).forEach(r => { if (!seen[r.card_key]) { seen[r.card_key] = 1; keys.push(r.card_key); } });
+    return res.json({ success: true, cards: keys });
+  } catch (e) {
+    console.error('card-list error:', e);
+    return res.status(500).json({ success: false, error: 'card list failed' });
+  }
 });
 
-// ---- STOCK HISTORY (Yahoo Finance, cached) ----
+// ---- STOCK HISTORY (Yahoo, cached) ----
 app.get('/api/stock-history', async (req, res) => {
   try {
     const ticker = (req.query.ticker || '').toUpperCase().trim();
     const win = (req.query.window || '12M').toUpperCase();
     if (!ticker) return res.status(400).json({ success: false, error: 'ticker required' });
 
-    // 1) cache check
     const { data: cached } = await supabase
-      .from('cardstock_stock_cache')
-      .select('payload, cached_at')
-      .eq('ticker', ticker)
-      .eq('window_key', win)
-      .maybeSingle();
-
+      .from('cardstock_stock_cache').select('payload, cached_at')
+      .eq('ticker', ticker).eq('window_key', win).maybeSingle();
     if (cached && cached.payload) {
       const ageHrs = (Date.now() - new Date(cached.cached_at).getTime()) / 3600000;
       if (ageHrs < CACHE_HOURS) return res.json({ ...cached.payload, cached: true });
     }
 
-    // 2) fetch from Yahoo
-    const range = windowRange(win);
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=1d`;
-    const r = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept': 'application/json'
-      }
-    });
-
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${yRange(win)}&interval=1d`;
+    const r = await fetch(url, { headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      'Accept': 'application/json' } });
     if (!r.ok) {
       if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
       return res.status(502).json({ success: false, error: 'Stock source unavailable (' + r.status + ')' });
     }
-
     const data = await r.json();
     const result = data && data.chart && data.chart.result && data.chart.result[0];
     if (!result || !result.timestamp || !result.indicators || !result.indicators.quote) {
       if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
       return res.status(404).json({ success: false, error: 'No stock data for ' + ticker });
     }
-
     const stamps = result.timestamp;
     const closes = result.indicators.quote[0].close || [];
     const points = [];
@@ -91,21 +87,15 @@ app.get('/api/stock-history', async (req, res) => {
       if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
       return res.status(404).json({ success: false, error: 'No stock data in window' });
     }
-
     const payload = {
-      success: true,
-      ticker,
+      success: true, ticker,
       start: +points[0].price.toFixed(2),
       end: +points[points.length - 1].price.toFixed(2),
       changePct: +(((points[points.length - 1].price / points[0].price) - 1) * 100).toFixed(1),
       series: indexTo100(points)
     };
-
-    // 3) cache it
     await supabase.from('cardstock_stock_cache').upsert({
-      ticker, window_key: win, payload, cached_at: new Date().toISOString()
-    });
-
+      ticker, window_key: win, payload, cached_at: new Date().toISOString() });
     return res.json({ ...payload, cached: false });
   } catch (e) {
     console.error('stock-history error:', e);
@@ -118,13 +108,10 @@ app.get('/api/card-history', async (req, res) => {
   try {
     const query = (req.query.query || '').trim();
     if (!query) return res.status(400).json({ success: false, error: 'query required' });
-    function wd(w){ if(w==='3M')return 90; if(w==='6M')return 182; return 365; }
     const cutoff = new Date(Date.now() - wd((req.query.window||'12M').toUpperCase()) * 86400 * 1000).toISOString();
     const { data, error } = await supabase
-      .from('cardstock_history')
-      .select('logged_at, price, sold_count')
-      .eq('card_key', query)
-      .gte('logged_at', cutoff)
+      .from('cardstock_history').select('logged_at, price, sold_count')
+      .eq('card_key', query).gte('logged_at', cutoff)
       .order('logged_at', { ascending: true });
     if (error) throw error;
     if (!data || !data.length) {
@@ -153,8 +140,7 @@ app.post('/api/log-card', async (req, res) => {
     if (!card_key || !price) return res.status(400).json({ success: false, error: 'card_key and price required' });
     const { error } = await supabase.from('cardstock_history').insert({
       card_key: String(card_key), price: Number(price),
-      sold_count: sold_count ? Number(sold_count) : null, logged_at: new Date().toISOString()
-    });
+      sold_count: sold_count ? Number(sold_count) : null, logged_at: new Date().toISOString() });
     if (error) throw error;
     return res.json({ success: true, logged: card_key });
   } catch (e) {
@@ -164,6 +150,5 @@ app.post('/api/log-card', async (req, res) => {
 });
 
 app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('CardStock API v4 (Yahoo) on ' + PORT));
+app.listen(PORT, () => console.log('CardStock API v5 on ' + PORT));
