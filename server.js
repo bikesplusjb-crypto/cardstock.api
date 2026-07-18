@@ -1,9 +1,13 @@
 // =============================================================
-//  CARDSTOCK API v5 — Yahoo stocks + card history + card list
-//  Adds /api/card-list for search autocomplete.
+//  CARDSTOCK API v6 — Yahoo stocks + REAL CardGauge card history
+//  Card side now reads your existing price_history table
+//  (the CardGauge Time Machine data — months of real snapshots).
 //
-//  ENV VARS on Render: SUPABASE_URL, SUPABASE_SERVICE, LOG_SECRET
-//  Tables: cardstock_history, cardstock_stock_cache
+//  ENV VARS on Render: SUPABASE_URL, SUPABASE_SERVICE
+//  (LOG_SECRET no longer needed — CardGauge already logs the data.)
+//
+//  Reads table: price_history (card_name, price, recorded_on, source)
+//  Reads/writes: cardstock_stock_cache (stock cache)
 // =============================================================
 
 const express = require('express');
@@ -26,24 +30,70 @@ function indexTo100(points) {
 function wd(w){ if(w==='3M')return 90; if(w==='6M')return 182; return 365; }
 function yRange(w){ if(w==='3M')return '3mo'; if(w==='6M')return '6mo'; return '1y'; }
 
-app.get('/', (req, res) => res.json({ success: true, app: 'CardStock API', status: 'online' }));
+app.get('/', (req, res) => res.json({ success: true, app: 'CardStock API v6', status: 'online' }));
 
-// ---- CARD LIST (for search autocomplete) ----
-// Returns the distinct card_keys that have any logged history.
+// ---- CARD LIST (distinct card_names from real price_history) ----
 app.get('/api/card-list', async (req, res) => {
   try {
     const { data, error } = await supabase
-      .from('cardstock_history')
-      .select('card_key')
-      .order('card_key', { ascending: true });
+      .from('price_history')
+      .select('card_name')
+      .order('card_name', { ascending: true });
     if (error) throw error;
     const seen = {};
     const keys = [];
-    (data || []).forEach(r => { if (!seen[r.card_key]) { seen[r.card_key] = 1; keys.push(r.card_key); } });
+    (data || []).forEach(r => { if (r.card_name && !seen[r.card_name]) { seen[r.card_name] = 1; keys.push(r.card_name); } });
     return res.json({ success: true, cards: keys });
   } catch (e) {
     console.error('card-list error:', e);
     return res.status(500).json({ success: false, error: 'card list failed' });
+  }
+});
+
+// ---- CARD HISTORY (from real price_history) ----
+app.get('/api/card-history', async (req, res) => {
+  try {
+    const query = (req.query.query || '').trim();
+    if (!query) return res.status(400).json({ success: false, error: 'query required' });
+    const cutoffDate = new Date(Date.now() - wd((req.query.window||'12M').toUpperCase()) * 86400 * 1000)
+      .toISOString().slice(0, 10); // YYYY-MM-DD to match recorded_on (date)
+
+    const { data, error } = await supabase
+      .from('price_history')
+      .select('recorded_on, price')
+      .eq('card_name', query)
+      .gte('recorded_on', cutoffDate)
+      .order('recorded_on', { ascending: true });
+    if (error) throw error;
+
+    if (!data || !data.length) {
+      return res.json({ success: true, query, series: [], points: 0,
+        note: 'No history logged yet for this card. The line fills in as prices are logged daily.' });
+    }
+
+    // one price per day already (unique index), but average any dupes defensively
+    const byDay = {};
+    data.forEach(r => {
+      const d = r.recorded_on;
+      if (!byDay[d]) byDay[d] = [];
+      byDay[d].push(Number(r.price));
+    });
+    const points = Object.keys(byDay).sort().map(d => ({
+      t: new Date(d).getTime(),
+      price: byDay[d].reduce((a, b) => a + b, 0) / byDay[d].length
+    }));
+
+    return res.json({
+      success: true, query,
+      start: +points[0].price.toFixed(2),
+      end: +points[points.length - 1].price.toFixed(2),
+      changePct: +(((points[points.length - 1].price / points[0].price) - 1) * 100).toFixed(1),
+      points: points.length,
+      series: indexTo100(points)
+    });
+  } catch (e) {
+    console.error('card-history error:', e);
+    return res.status(500).json({ success: false, error: 'Card history fetch failed' });
   }
 });
 
@@ -103,52 +153,6 @@ app.get('/api/stock-history', async (req, res) => {
   }
 });
 
-// ---- CARD HISTORY ----
-app.get('/api/card-history', async (req, res) => {
-  try {
-    const query = (req.query.query || '').trim();
-    if (!query) return res.status(400).json({ success: false, error: 'query required' });
-    const cutoff = new Date(Date.now() - wd((req.query.window||'12M').toUpperCase()) * 86400 * 1000).toISOString();
-    const { data, error } = await supabase
-      .from('cardstock_history').select('logged_at, price, sold_count')
-      .eq('card_key', query).gte('logged_at', cutoff)
-      .order('logged_at', { ascending: true });
-    if (error) throw error;
-    if (!data || !data.length) {
-      return res.json({ success: true, query, series: [], points: 0,
-        note: 'No history logged yet for this card. The line fills in as prices are logged daily.' });
-    }
-    const points = data.map(d => ({ t: new Date(d.logged_at).getTime(), price: Number(d.price) }));
-    const totalSold = data.reduce((a, d) => a + (d.sold_count || 0), 0);
-    return res.json({
-      success: true, query,
-      start: points[0].price, end: points[points.length - 1].price,
-      changePct: +(((points[points.length - 1].price / points[0].price) - 1) * 100).toFixed(1),
-      points: points.length, soldCount: totalSold, series: indexTo100(points)
-    });
-  } catch (e) {
-    console.error('card-history error:', e);
-    return res.status(500).json({ success: false, error: 'Card history fetch failed' });
-  }
-});
-
-// ---- LOG A CARD PRICE ----
-app.post('/api/log-card', async (req, res) => {
-  try {
-    const { secret, card_key, price, sold_count } = req.body || {};
-    if (secret !== process.env.LOG_SECRET) return res.status(403).json({ success: false, error: 'forbidden' });
-    if (!card_key || !price) return res.status(400).json({ success: false, error: 'card_key and price required' });
-    const { error } = await supabase.from('cardstock_history').insert({
-      card_key: String(card_key), price: Number(price),
-      sold_count: sold_count ? Number(sold_count) : null, logged_at: new Date().toISOString() });
-    if (error) throw error;
-    return res.json({ success: true, logged: card_key });
-  } catch (e) {
-    console.error('log-card error:', e);
-    return res.status(500).json({ success: false, error: 'log failed' });
-  }
-});
-
 app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('CardStock API v5 on ' + PORT));
+app.listen(PORT, () => console.log('CardStock API v6 on ' + PORT));
