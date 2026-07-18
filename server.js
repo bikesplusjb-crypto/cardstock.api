@@ -1,14 +1,14 @@
 // =============================================================
-//  CARDSTOCK API v3 — with stock caching
-//  Stock history: Alpha Vantage (cached daily in Supabase)
+//  CARDSTOCK API v4 — Yahoo Finance (no key) + caching
+//  Stock history: Yahoo Finance chart endpoint (cached in Supabase)
 //  Card history: Supabase
 //
-//  ENV VARS on Render:
-//    ALPHAVANTAGE_KEY, SUPABASE_URL, SUPABASE_SERVICE, LOG_SECRET
+//  ENV VARS on Render (FINNHUB/ALPHAVANTAGE no longer needed):
+//    SUPABASE_URL, SUPABASE_SERVICE, LOG_SECRET
 //
-//  Run BOTH SQL files in Supabase first:
-//    cardstock_table.sql        (card history)
-//    cardstock_cache_table.sql  (stock cache)
+//  Requires both Supabase tables:
+//    cardstock_history       (card history)
+//    cardstock_stock_cache   (stock cache)
 // =============================================================
 
 const express = require('express');
@@ -19,10 +19,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const AV_KEY = process.env.ALPHAVANTAGE_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE);
-
-const CACHE_HOURS = 12; // re-fetch a ticker at most twice a day
+const CACHE_HOURS = 12;
 
 function indexTo100(points) {
   if (!points.length) return [];
@@ -30,25 +28,24 @@ function indexTo100(points) {
   if (!base) return points.map(p => ({ t: p.t, v: 100 }));
   return points.map(p => ({ t: p.t, v: +((p.price / base) * 100).toFixed(2) }));
 }
-function windowDays(win) {
-  if (win === '3M') return 90;
-  if (win === '6M') return 182;
-  return 365;
+function windowRange(win) {
+  if (win === '3M') return '3mo';
+  if (win === '6M') return '6mo';
+  return '1y';
 }
 
 app.get('/', (req, res) => {
   res.json({ success: true, app: 'CardStock API', status: 'online' });
 });
 
-// ---- STOCK HISTORY (cached) ----
+// ---- STOCK HISTORY (Yahoo Finance, cached) ----
 app.get('/api/stock-history', async (req, res) => {
   try {
-    if (!AV_KEY) return res.status(500).json({ success: false, error: 'Stock data not configured.' });
     const ticker = (req.query.ticker || '').toUpperCase().trim();
     const win = (req.query.window || '12M').toUpperCase();
     if (!ticker) return res.status(400).json({ success: false, error: 'ticker required' });
 
-    // 1) try cache
+    // 1) cache check
     const { data: cached } = await supabase
       .from('cardstock_stock_cache')
       .select('payload, cached_at')
@@ -58,46 +55,53 @@ app.get('/api/stock-history', async (req, res) => {
 
     if (cached && cached.payload) {
       const ageHrs = (Date.now() - new Date(cached.cached_at).getTime()) / 3600000;
-      if (ageHrs < CACHE_HOURS) {
-        return res.json({ ...cached.payload, cached: true });
+      if (ageHrs < CACHE_HOURS) return res.json({ ...cached.payload, cached: true });
+    }
+
+    // 2) fetch from Yahoo
+    const range = windowRange(win);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=1d`;
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept': 'application/json'
       }
-    }
+    });
 
-    // 2) cache miss or stale — fetch from Alpha Vantage
-    const need = windowDays(win);
-    const size = need > 100 ? 'full' : 'compact';
-    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(ticker)}&outputsize=${size}&apikey=${AV_KEY}`;
-    const r = await fetch(url);
-    const data = await r.json();
-
-    if (data.Note || data.Information) {
-      // rate-limited: serve stale cache if we have any, else error
+    if (!r.ok) {
       if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
-      return res.status(429).json({ success: false, error: 'Stock data busy, try again shortly.' });
+      return res.status(502).json({ success: false, error: 'Stock source unavailable (' + r.status + ')' });
     }
-    const ts = data['Time Series (Daily)'];
-    if (!ts) {
+
+    const data = await r.json();
+    const result = data && data.chart && data.chart.result && data.chart.result[0];
+    if (!result || !result.timestamp || !result.indicators || !result.indicators.quote) {
       if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
       return res.status(404).json({ success: false, error: 'No stock data for ' + ticker });
     }
 
-    const cutoff = Date.now() - need * 86400 * 1000;
-    const points = Object.keys(ts)
-      .map(d => ({ t: new Date(d).getTime(), price: parseFloat(ts[d]['4. close']) }))
-      .filter(p => p.t >= cutoff)
-      .sort((a, b) => a.t - b.t);
-    if (!points.length) return res.status(404).json({ success: false, error: 'No stock data in window' });
+    const stamps = result.timestamp;
+    const closes = result.indicators.quote[0].close || [];
+    const points = [];
+    for (let i = 0; i < stamps.length; i++) {
+      const c = closes[i];
+      if (c != null && !isNaN(c)) points.push({ t: stamps[i] * 1000, price: c });
+    }
+    if (!points.length) {
+      if (cached && cached.payload) return res.json({ ...cached.payload, cached: true, stale: true });
+      return res.status(404).json({ success: false, error: 'No stock data in window' });
+    }
 
     const payload = {
       success: true,
       ticker,
-      start: points[0].price,
-      end: points[points.length - 1].price,
+      start: +points[0].price.toFixed(2),
+      end: +points[points.length - 1].price.toFixed(2),
       changePct: +(((points[points.length - 1].price / points[0].price) - 1) * 100).toFixed(1),
       series: indexTo100(points)
     };
 
-    // 3) write to cache (upsert)
+    // 3) cache it
     await supabase.from('cardstock_stock_cache').upsert({
       ticker, window_key: win, payload, cached_at: new Date().toISOString()
     });
@@ -114,7 +118,8 @@ app.get('/api/card-history', async (req, res) => {
   try {
     const query = (req.query.query || '').trim();
     if (!query) return res.status(400).json({ success: false, error: 'query required' });
-    const cutoff = new Date(Date.now() - windowDays(req.query.window) * 86400 * 1000).toISOString();
+    function wd(w){ if(w==='3M')return 90; if(w==='6M')return 182; return 365; }
+    const cutoff = new Date(Date.now() - wd((req.query.window||'12M').toUpperCase()) * 86400 * 1000).toISOString();
     const { data, error } = await supabase
       .from('cardstock_history')
       .select('logged_at, price, sold_count')
@@ -161,4 +166,4 @@ app.post('/api/log-card', async (req, res) => {
 app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('CardStock API v3 on ' + PORT));
+app.listen(PORT, () => console.log('CardStock API v4 (Yahoo) on ' + PORT));
